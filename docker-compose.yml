@@ -1,0 +1,35 @@
+# Cisco FMC MCP server
+# Usage:
+#   cp .env.example .env   # fill FMC_* values
+#   docker compose up -d --build
+# MCP endpoint (default): http://127.0.0.1:8000/mcp
+
+services:
+  fmc-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cisco-fmc-mcp:local
+    container_name: cisco-fmc-mcp
+    restart: unless-stopped
+    ports:
+      # Change left side to expose on a different host port/address, e.g. "127.0.0.1:18000:8000"
+      - "127.0.0.1:8000:8000"
+    environment:
+      # FMC connection (required)
+      FMC_HOST: ${FMC_HOST:?Set FMC_HOST, e.g. https://fmc.example.local}
+      FMC_USERNAME: ${FMC_USERNAME:?Set FMC_USERNAME}
+      FMC_PASSWORD: ${FMC_PASSWORD:?Set FMC_PASSWORD}
+      FMC_DOMAIN_UUID: ${FMC_DOMAIN_UUID:-}
+      FMC_VERIFY_SSL: ${FMC_VERIFY_SSL:-true}
+      FMC_CA_BUNDLE: ${FMC_CA_BUNDLE:-}
+      # Safety: keep false unless you intentionally need write tools.
+      FMC_ALLOW_WRITES: ${FMC_ALLOW_WRITES:-false}
+      # MCP server
+      MCP_TRANSPORT: ${MCP_TRANSPORT:-http}
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 8000
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    # If using FMC_CA_BUNDLE, mount the CA file and set FMC_CA_BUNDLE to the container path.
+    # volumes:
+    #   - ./certs/fmc-ca.pem:/certs/fmc-ca.pem:ro
