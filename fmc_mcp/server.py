@@ -101,6 +101,32 @@ def _clean(d: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in d.items() if v is not None and v != ""}
 
 
+_COMPACT_KEEP = {
+    "hosts": ("id", "name", "type", "value", "description"),
+    "networks": ("id", "name", "type", "value", "description"),
+    "ranges": ("id", "name", "type", "value", "description"),
+    "fqdns": ("id", "name", "type", "value", "dnsResolution", "description"),
+    "ports": ("id", "name", "type", "protocol", "port", "description"),
+    "port_object_groups": ("id", "name", "type", "description"),
+    "network_groups": ("id", "name", "type", "description"),
+    "urls": ("id", "name", "type", "url", "description"),
+}
+
+
+def _slim_item(item: Any, kind: str | None = None, expanded: bool = False) -> Any:
+    """Reduce FMC object verbosity for token-efficient MCP responses."""
+    if not isinstance(item, dict):
+        return item
+    if expanded:
+        # drop the noisiest fields but keep full data otherwise
+        return {k: v for k, v in item.items() if k not in {"links", "paging"}}
+    keep = _COMPACT_KEEP.get(kind or "", ("id", "name", "type"))
+    out = {k: item[k] for k in keep if k in item}
+    if "overridable" in item:
+        out["overridable"] = item["overridable"]
+    return out or {k: v for k, v in item.items() if k not in {"links", "metadata", "paging"}}
+
+
 # ---------- Read / status ----------
 
 
@@ -122,13 +148,20 @@ async def get_fmc_status() -> dict[str, Any]:
 
 
 @mcp.tool
-async def get_deployment_status() -> dict[str, Any]:
-    """List devices with undeployed/pending configuration changes."""
+async def get_deployment_status(limit: int = 100, offset: int = 0) -> dict[str, Any]:
+    """List devices with undeployed/pending configuration changes (paged, slimmed)."""
     try:
         client = await get_client()
         path = await client.config_path("/deployment/deployabledevices")
         items = await client.get_all(path)
-        return ok(pending_device_count=len(items), pending_devices=items)
+        page = items[max(0, offset): max(0, offset) + max(0, min(limit, 500))]
+        slim = []
+        for d in page:
+            if isinstance(d, dict):
+                slim.append({k: d.get(k) for k in ("id", "name", "type", "device", "version", "canBeDeployed", "selected", "status") if d.get(k) is not None} or _slim_item(d, expanded=False))
+            else:
+                slim.append(d)
+        return ok(pending_device_count=len(items), returned=len(slim), offset=max(0, offset), limit=limit, pending_devices=slim)
     except (FMCAPIError, Exception) as exc:
         return fail(exc)
 
@@ -148,12 +181,18 @@ OBJECT_ENDPOINTS = {
 }
 
 
-async def _list_objects(kind: str, expanded: bool = False, limit: int = 1000) -> dict[str, Any]:
+async def _list_objects(kind: str, expanded: bool = False, limit: int = 100, offset: int = 0) -> dict[str, Any]:
     try:
         client = await get_client()
         suffix = OBJECT_ENDPOINTS[kind]
-        items = await client.get_all(await client.config_path(suffix), expanded=expanded, limit=limit)
-        return ok(kind=kind, count=len(items), items=items)
+        limit = max(0, min(int(limit), 1000))
+        offset = max(0, int(offset))
+        # fetch a bounded window (offset+limit) to support paging without pulling everything
+        fetch_limit = min(1000, offset + limit if limit else offset + 100)
+        items = await client.get_all(await client.config_path(suffix), expanded=expanded, limit=fetch_limit)
+        page = items[offset: offset + limit] if limit else items[offset:]
+        page = [_slim_item(i, kind=kind, expanded=expanded) for i in page]
+        return ok(kind=kind, total=len(items), returned=len(page), offset=offset, limit=limit, items=page)
     except Exception as exc:
         return fail(exc)
 
@@ -162,7 +201,10 @@ async def _get_object(kind: str, object_id: str) -> dict[str, Any]:
     try:
         client = await get_client()
         path = await client.config_path(f"{OBJECT_ENDPOINTS[kind]}/{object_id}")
-        return ok(item=await client.get(path))
+        item = await client.get(path)
+        if isinstance(item, dict):
+            item = {k: v for k, v in item.items() if k != "links"}
+        return ok(item=item)
     except Exception as exc:
         return fail(exc)
 
@@ -203,9 +245,9 @@ async def _delete_object(kind: str, object_id: str) -> dict[str, Any]:
 
 
 @mcp.tool
-async def list_hosts(expanded: bool = False, limit: int = 1000) -> dict[str, Any]:
-    """List FMC host objects."""
-    return await _list_objects("hosts", expanded=expanded, limit=limit)
+async def list_hosts(expanded: bool = False, limit: int = 100, offset: int = 0) -> dict[str, Any]:
+    """List FMC host objects (paged, compact by default)."""
+    return await _list_objects("hosts", expanded=expanded, limit=limit, offset=offset)
 
 
 @mcp.tool
@@ -260,9 +302,9 @@ async def delete_host(object_id: str) -> dict[str, Any]:
 
 
 @mcp.tool
-async def list_networks(expanded: bool = False, limit: int = 1000) -> dict[str, Any]:
-    """List FMC network objects."""
-    return await _list_objects("networks", expanded=expanded, limit=limit)
+async def list_networks(expanded: bool = False, limit: int = 100, offset: int = 0) -> dict[str, Any]:
+    """List FMC network objects (paged, compact by default)."""
+    return await _list_objects("networks", expanded=expanded, limit=limit, offset=offset)
 
 
 @mcp.tool
@@ -317,9 +359,9 @@ async def delete_network(object_id: str) -> dict[str, Any]:
 
 
 @mcp.tool
-async def list_port_objects(expanded: bool = False, limit: int = 1000) -> dict[str, Any]:
-    """List FMC protocol/port (service) objects."""
-    return await _list_objects("ports", expanded=expanded, limit=limit)
+async def list_port_objects(expanded: bool = False, limit: int = 100, offset: int = 0) -> dict[str, Any]:
+    """List FMC protocol/port (service) objects (paged, compact by default)."""
+    return await _list_objects("ports", expanded=expanded, limit=limit, offset=offset)
 
 
 @mcp.tool
@@ -384,23 +426,50 @@ async def delete_port_object(object_id: str) -> dict[str, Any]:
 
 
 @mcp.tool
-async def list_devices(expanded: bool = True, limit: int = 1000) -> dict[str, Any]:
-    """List FMC managed device records (FTD, etc.)."""
+async def list_devices(expanded: bool = False, limit: int = 100, offset: int = 0) -> dict[str, Any]:
+    """List FMC managed device records (FTD, etc.), paged and compact by default."""
     try:
         client = await get_client()
-        items = await client.get_all(await client.config_path("/devices/devicerecords"), expanded=expanded, limit=limit)
-        return ok(count=len(items), items=items)
+        limit = max(0, min(int(limit), 1000))
+        offset = max(0, int(offset))
+        fetch_limit = min(1000, offset + limit if limit else offset + 100)
+        items = await client.get_all(await client.config_path("/devices/devicerecords"), expanded=expanded, limit=fetch_limit)
+        page = items[offset: offset + limit] if limit else items[offset:]
+        slim = []
+        for d in page:
+            if isinstance(d, dict):
+                if expanded:
+                    slim.append({k: v for k, v in d.items() if k != "links"})
+                else:
+                    slim.append({k: d.get(k) for k in ("id", "name", "type", "hostName", "model", "sw_version", "healthStatus", "deviceGroup") if d.get(k) is not None} or _slim_item(d, expanded=False))
+            else:
+                slim.append(d)
+        return ok(total=len(items), returned=len(slim), offset=offset, limit=limit, items=slim)
     except Exception as exc:
         return fail(exc)
 
 
 @mcp.tool
-async def list_policy_assignments(expanded: bool = True, limit: int = 1000) -> dict[str, Any]:
-    """List policy assignments (which policies are assigned to which devices/device groups/templates)."""
+async def list_policy_assignments(expanded: bool = False, limit: int = 100, offset: int = 0) -> dict[str, Any]:
+    """List policy assignments, paged and compact by default."""
     try:
         client = await get_client()
-        items = await client.get_all(await client.config_path("/assignment/policyassignments"), expanded=expanded, limit=limit)
-        return ok(count=len(items), items=items)
+        limit = max(0, min(int(limit), 1000))
+        offset = max(0, int(offset))
+        fetch_limit = min(1000, offset + limit if limit else offset + 100)
+        items = await client.get_all(await client.config_path("/assignment/policyassignments"), expanded=expanded, limit=fetch_limit)
+        page = items[offset: offset + limit] if limit else items[offset:]
+        slim = []
+        for a in page:
+            if not isinstance(a, dict):
+                slim.append(a); continue
+            if expanded:
+                slim.append({k: v for k, v in a.items() if k != "links"})
+            else:
+                pol = a.get("policy") or {}
+                targets = [{"id": t.get("id"), "name": t.get("name"), "type": t.get("type")} for t in (a.get("targets") or []) if isinstance(t, dict)]
+                slim.append({"id": a.get("id"), "name": a.get("name"), "type": a.get("type"), "policy": {k: pol.get(k) for k in ("id","name","type") if pol.get(k) is not None}, "targets": targets})
+        return ok(total=len(items), returned=len(slim), offset=offset, limit=limit, items=slim)
     except Exception as exc:
         return fail(exc)
 
@@ -409,22 +478,38 @@ async def list_policy_assignments(expanded: bool = True, limit: int = 1000) -> d
 
 
 @mcp.tool
-async def list_access_policies(expanded: bool = False, limit: int = 1000) -> dict[str, Any]:
-    """List FMC access control policies."""
+async def list_access_policies(expanded: bool = False, limit: int = 100, offset: int = 0) -> dict[str, Any]:
+    """List FMC access control policies (paged, compact by default)."""
     try:
         client = await get_client()
-        items = await client.get_all(await client.config_path("/policy/accesspolicies"), expanded=expanded, limit=limit)
-        return ok(count=len(items), items=items)
+        limit = max(0, min(int(limit), 1000))
+        offset = max(0, int(offset))
+        fetch_limit = min(1000, offset + limit if limit else offset + 100)
+        items = await client.get_all(await client.config_path("/policy/accesspolicies"), expanded=expanded, limit=fetch_limit)
+        page = items[offset: offset + limit] if limit else items[offset:]
+        slim = []
+        for p in page:
+            if not isinstance(p, dict):
+                slim.append(p); continue
+            if expanded:
+                slim.append({k: v for k, v in p.items() if k != "links"})
+            else:
+                da = p.get("defaultAction") or {}
+                slim.append({"id": p.get("id"), "name": p.get("name"), "type": p.get("type"), "defaultAction": da.get("action") if isinstance(da, dict) else da})
+        return ok(total=len(items), returned=len(slim), offset=offset, limit=limit, items=slim)
     except Exception as exc:
         return fail(exc)
 
 
 @mcp.tool
 async def get_access_policy(policy_id: str) -> dict[str, Any]:
-    """Get an access control policy by ID."""
+    """Get an access control policy by ID (links omitted)."""
     try:
         client = await get_client()
-        return ok(item=await client.get(await client.config_path(f"/policy/accesspolicies/{policy_id}")))
+        item = await client.get(await client.config_path(f"/policy/accesspolicies/{policy_id}"))
+        if isinstance(item, dict):
+            item = {k: v for k, v in item.items() if k != "links"}
+        return ok(item=item)
     except Exception as exc:
         return fail(exc)
 
@@ -481,10 +566,13 @@ async def list_access_rules(
 
 @mcp.tool
 async def get_access_rule(policy_id: str, rule_id: str) -> dict[str, Any]:
-    """Get a single access rule by policy ID and rule ID."""
+    """Get a single access rule by policy ID and rule ID (links omitted)."""
     try:
         client = await get_client()
-        return ok(item=await client.get(await _rules_path(policy_id, rule_id)))
+        item = await client.get(await _rules_path(policy_id, rule_id))
+        if isinstance(item, dict):
+            item = {k: v for k, v in item.items() if k != "links"}
+        return ok(item=item)
     except Exception as exc:
         return fail(exc)
 
@@ -547,9 +635,9 @@ async def delete_access_rule(policy_id: str, rule_id: str) -> dict[str, Any]:
 
 
 @mcp.tool
-async def list_ranges(expanded: bool = False, limit: int = 1000) -> dict[str, Any]:
-    """List FMC range objects (IPv4/IPv6 ranges)."""
-    return await _list_objects("ranges", expanded=expanded, limit=limit)
+async def list_ranges(expanded: bool = False, limit: int = 100, offset: int = 0) -> dict[str, Any]:
+    """List FMC range objects (paged, compact by default)."""
+    return await _list_objects("ranges", expanded=expanded, limit=limit, offset=offset)
 
 
 @mcp.tool
@@ -559,9 +647,9 @@ async def get_range(object_id: str) -> dict[str, Any]:
 
 
 @mcp.tool
-async def list_fqdns(expanded: bool = False, limit: int = 1000) -> dict[str, Any]:
-    """List FMC FQDN objects."""
-    return await _list_objects("fqdns", expanded=expanded, limit=limit)
+async def list_fqdns(expanded: bool = False, limit: int = 100, offset: int = 0) -> dict[str, Any]:
+    """List FMC FQDN objects (paged, compact by default)."""
+    return await _list_objects("fqdns", expanded=expanded, limit=limit, offset=offset)
 
 
 @mcp.tool
